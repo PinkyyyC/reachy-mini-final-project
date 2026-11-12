@@ -1,0 +1,27 @@
+# Virtual environment
+.venv/
+
+# Test files
+test/
+test_main.py
+mock_scenario.py
+
+# Python cache
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# Audio files
+*.wav
+
+# Audio API keys
+audio/.env
+
+# Audio logs
+audio/logs/
+
+# Kokoro models (large model files)
+audio/models/*.onnx
+audio/models/*.bin
+audio/models/*.onnx.json
+
