@@ -1,6 +1,8 @@
 import time
 import threading
 from reachy_mini.motion.recorded_move import RecordedMove, RecordedMoves
+from reachy_mini.motion.move import Move
+from scipy.spatial.transform import Rotation as R
 
 DATASET = "pollen-robotics/reachy-mini-emotions-library"
 
@@ -81,6 +83,30 @@ EXPRESSION_MAP = {
 import numpy as np
 from reachy_mini.utils import create_head_pose
 
+class YawOffsetMove(Move):
+    """將原始 RecordedMove 的頭部動作，整體旋轉一個水平 Yaw 偏移角度"""
+
+    def __init__(self, base_move, yaw_offset_deg: float):
+        self._base_move = base_move
+        # 建立繞 Z 軸（水平左右轉頭）的 4x4 旋轉矩陣
+        rot = R.from_euler("z", yaw_offset_deg, degrees=True).as_matrix()
+        self._rot_4x4 = np.eye(4)
+        self._rot_4x4[:3, :3] = rot
+
+    @property
+    def duration(self) -> float:
+        return self._base_move.duration
+
+    def evaluate(self, t: float):
+        # 取得原始動作在時間點 t 的 (head_pose, antennas, body_yaw)
+        head, antennas, body_yaw = self._base_move.evaluate(t)
+
+        if head is not None:
+            # 將原本朝正前方的頭部姿態矩陣，左乘 Z 軸旋轉矩陣，讓動作朝向目前看的人
+            head = self._rot_4x4 @ head
+
+        return head, antennas, body_yaw
+
 class ExpressionController:
     def __init__(self, mini):
         self.mini = mini
@@ -109,14 +135,18 @@ class ExpressionController:
         pose = create_head_pose(yaw=target_yaw, degrees=True)
         self.mini.set_target(head=pose)
 
+    def _get_offset_move(self, move_name: str) -> YawOffsetMove:
+        """ Get action with current head rotation offset """
+        raw_move = self.library.get(move_name)
+        return YawOffsetMove(raw_move.move, yaw_offset_deg=self._current_yaw_deg)
+    
     def play_quick_nod(self):
         """Non-blocking friendly backchannel nod ('understanding1') while listening."""
         if self._motion_lock.locked():
             return
         with self._motion_lock:
-            move = self.library.get("understanding1")
-            motion_only = RecordedMove(move=move.move, sound_path=None)
-            self.mini.play_move(motion_only, initial_goto_duration=0.3)
+            offset_nod = self._get_offset_move("understanding1")
+            self.mini.play_move(offset_nod, initial_goto_duration=0.25)
 
     def play(self, expression: str, voice=None):
         if expression not in EXPRESSION_MAP:
@@ -125,16 +155,25 @@ class ExpressionController:
 
         with self._motion_lock:
             move_name = EXPRESSION_MAP[expression]
-            move = self.library.get(move_name)
-            motion_only = RecordedMove(move=move.move, sound_path=None)
+            # move = self.library.get(move_name)
+            # motion_only = RecordedMove(move=move.move, sound_path=None)
+            offset_main_move = self._get_offset_move(move_name)
 
-            self.mini.play_move(motion_only, initial_goto_duration=0.5)
+            # self.mini.play_move(motion_only, initial_goto_duration=0.5)
+            # face the speaker and play move
+            self.mini.play_move(offset_main_move, initial_goto_duration=0.4)
 
-            fill_move = self.library.get("attentive1")
-            fill_motion = RecordedMove(move=fill_move.move, sound_path=None)
+            # fill_move = self.library.get("attentive1")
+            # fill_motion = RecordedMove(move=fill_move.move, sound_path=None)
 
+            # while voice is not None and voice.speaking:
+            #     self.mini.play_move(fill_motion, initial_goto_duration=0.2)
+            #     time.sleep(0.05)
+            
+            # if robot hasn't end talking, face the speaker and play 'attentive'
             while voice is not None and voice.speaking:
-                self.mini.play_move(fill_motion, initial_goto_duration=0.2)
+                offset_fill_move = self._get_offset_move("attentive1")
+                self.mini.play_move(offset_fill_move, initial_goto_duration=0.2)
                 time.sleep(0.05)
 
             self.current_expression = expression

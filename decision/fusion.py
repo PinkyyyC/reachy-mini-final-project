@@ -162,59 +162,6 @@ def detect_addressee(
     }
 
 
-# ==========================================
-# 3. Dialogue Decision
-# ==========================================
-
-# def make_decision(
-#     audio_output: dict,
-#     vision_output: dict
-# ) -> dict:
-#     """
-#     Combine speaker identification and addressee detection.
-
-#     Returns a decision dictionary for the NLP and robot-control modules.
-#     """
-
-#     utterance = audio_output.get("utterance", {})
-
-#     # Step 1: Identify the speaker
-#     speaker_result = identify_speaker(vision_output)
-#     speaker = speaker_result["speaker"]
-
-#     # Step 2: Detect the addressee
-#     addressee_result = detect_addressee(
-#         audio_output,
-#         vision_output,
-#         speaker
-#     )
-
-#     addressee = addressee_result["addressee"]
-
-#     # Step 3: Decide whether the robot should respond
-#     should_speak = addressee == "robot"
-
-#     # The robot should look toward the person who is speaking
-#     attention_target = speaker if speaker != "unknown" else None
-
-#     return {
-#         "utterance_id": utterance.get("id"),
-#         "speaker": speaker,
-#         "speaker_confidence": speaker_result["confidence"],
-#         "addressee": addressee,
-#         "addressee_confidence": addressee_result["confidence"],
-#         "should_speak": should_speak,
-#         "attention_target": attention_target,
-#         "intent": utterance.get("intent"),
-#         "text": utterance.get("text"),
-#         "evidence": {
-#             "speaker_method": speaker_result["method"],
-#             "addressee_method": addressee_result["method"],
-#             "said_name": utterance.get("said_name", False),
-#             "answering_robot": utterance.get("answering_robot", False)
-#         }
-#     }
-
 
 
 def make_decision(audio_output: dict, fused_cv_state: dict) -> dict:
