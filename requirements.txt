@@ -1,7 +1,7 @@
 # Robot
 reachy-mini==1.14.0          # match the robot daemon
 requests==2.34.2             # DoA polling over the robot's HTTP API (vision/step6)
-mujoco==3.3.0                # only for `python main.py --sim` (MuJoCo simulator; matches reachy-mini 1.14.0)
+mujoco==3.3.0                # only for the MuJoCo simulator (main_sim.py); matches reachy-mini 1.14.0
 
 # Audio in: speech detection and speech-to-text
 numpy==2.5.4
