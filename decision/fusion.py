@@ -185,7 +185,7 @@ def make_decision(audio_output: dict, fused_cv_state: dict) -> dict:
     # Priority: answering_robot > said_name > visual gaze (looking_at_robot)
     looking_at_robot = fused_cv_state.get("looking_at_robot", False)
 
-    if answering_robot:
+    if answering_robot and looking_at_robot:
         addressee = "robot"
         addressee_confidence = 1.0
         addressee_method = "answering_robot"
