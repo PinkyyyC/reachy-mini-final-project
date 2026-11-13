@@ -179,9 +179,30 @@ class ExpressionController:
             #     time.sleep(0.05)
             
             # if robot hasn't end talking, face the speaker and play 'attentive'
-            while voice is not None and voice.speaking:
+            if voice is not None and voice.speaking:
+                self._play_filler_while_speaking(voice)
+
+            self.current_expression = expression
+
+    def _play_filler_while_speaking(self, voice):
+        """Loop the 'attentive' move facing the speaker while Reachy is still talking, and cut
+        it off as soon as the speech ends instead of finishing the 4 s move. Call with the
+        lock held."""
+        done = threading.Event()
+
+        def cancel_when_quiet():
+            while not done.wait(0.05):
+                if not voice.speaking:
+                    self.mini.cancel_move()
+                    return
+
+        watcher = threading.Thread(target=cancel_when_quiet, daemon=True)
+        watcher.start()
+        try:
+            while voice.speaking:
                 offset_fill_move = self._get_offset_move("attentive1")
                 self.mini.play_move(offset_fill_move, initial_goto_duration=0.2)
                 time.sleep(0.05)
-
-            self.current_expression = expression
+        finally:
+            done.set()
+            watcher.join()

@@ -1,4 +1,6 @@
 from collections import deque
+from pathlib import Path
+import time
 import cv2
 import mediapipe as mp
 import numpy as np
@@ -40,15 +42,29 @@ class GazeAndLipTracker:
         self.MAR_OPEN_THRESHOLD = 0.12   # Minimum mouth opening required for speech
         # =====================================================================
 
-        self.cap = cv2.VideoCapture(camera_index)
-
-        self.mp_face_mesh = mp.solutions.face_mesh
-        self.face_mesh = self.mp_face_mesh.FaceMesh(
-            max_num_faces=2,
-            refine_landmarks=True,
-            min_detection_confidence=0.5,
+        model_path = Path(__file__).parent / "models" / "face_landmarker.task"
+        if not model_path.is_file():
+            raise FileNotFoundError(f"Missing MediaPipe face model: {model_path}")
+        options = mp.tasks.vision.FaceLandmarkerOptions(
+            base_options=mp.tasks.BaseOptions(
+                model_asset_path=str(model_path),
+                delegate=mp.tasks.BaseOptions.Delegate.CPU,
+            ),
+            running_mode=mp.tasks.vision.RunningMode.VIDEO,
+            num_faces=2,
+            min_face_detection_confidence=0.5,
             min_tracking_confidence=0.5,
         )
+        self.face_mesh = mp.tasks.vision.FaceLandmarker.create_from_options(options)
+        self._last_timestamp_ms = -1
+        self.cap = cv2.VideoCapture(camera_index)
+        if not self.cap.isOpened():
+            self.cap.release()
+            self.face_mesh.close()
+            raise RuntimeError(
+                f"Cannot open camera {camera_index}. Allow camera access for your terminal/IDE "
+                "in macOS System Settings > Privacy & Security > Camera."
+            )
 
         # Landmark indices
         self.NOSE_TIP = 1
@@ -164,12 +180,15 @@ class GazeAndLipTracker:
         h, w, _ = frame.shape
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         rgb.flags.writeable = False
-        results = self.face_mesh.process(rgb)
+        timestamp_ms = max(time.monotonic_ns() // 1_000_000, self._last_timestamp_ms + 1)
+        self._last_timestamp_ms = timestamp_ms
+        results = self.face_mesh.detect_for_video(
+            mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb), timestamp_ms
+        )
 
         faces_found = []
-        if results.multi_face_landmarks:
-            for lms_obj in results.multi_face_landmarks:
-                lms = lms_obj.landmark
+        if results.face_landmarks:
+            for lms in results.face_landmarks:
                 px_x = int(lms[self.NOSE_TIP].x * w)
                 px_y = int(lms[self.NOSE_TIP].y * h)
                 norm_x = round((px_x - (w / 2.0)) / (w / 2.0), 3)
