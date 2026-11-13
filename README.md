@@ -192,6 +192,11 @@ Most behaviour is set in `Config` in `audio/speaker_nlp_model.py`:
 Head-direction thresholds for "looking at Reachy" are at the top of
 `vision/step4_gaze_and_lips.py`.
 
+Reachy's voice is Kokoro's `am_fenrir`, the closest match we found to the voice Pollen's own
+app uses. To try another one, pass `kokoro_voice=` (and optionally `speed=`) to
+`ReachyVoice()` in `main.py`, for example `ReachyVoice(kokoro_voice="am_michael")`. Kokoro
+has about 20 American and 8 British English voices; see `Kokoro(...).get_voices()`.
+
 ## Troubleshooting
 
 - **The camera window freezes.** Check the terminal: the program now prints the cause. The
@@ -201,7 +206,7 @@ Head-direction thresholds for "looking at Reachy" are at the top of
 - **`Cannot open camera 0`.** Allow camera access for your terminal in System Settings →
   Privacy & Security → Camera, or try `--camera 1`.
 - **The voice is slow or robotic.** The first line printed should be
-  `[voice] kokoro (af_heart, kokoro-v1.0.onnx)`. If it says `say`, the Kokoro files are
+  `[voice] kokoro (am_fenrir, kokoro-v1.0.onnx)`. If it says `say`, the Kokoro files are
   missing from `audio/models/`.
 - **Harmless warnings:** `No Reachy Mini Audio USB device found` (the laptop isn't the robot),
   `libgstpython.dylib … Library not loaded` (an optional GStreamer plugin), and occasional

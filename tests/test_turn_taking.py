@@ -363,3 +363,9 @@ from reachy_voice import split_first_clause  # noqa: E402
 def test_split_first_clause(sentence, pieces):
     assert split_first_clause(sentence) == pieces
     assert " ".join(split_first_clause(sentence)) == sentence
+
+
+def test_reachy_is_pronounced_ree_chee():
+    from reachy_voice import say_it_right
+    assert say_it_right("Hi, I'm Reachy! That's Reachy's job.") == "Hi, I'm Reechy! That's Reechy's job."
+    assert say_it_right("I can reach you.") == "I can reach you."

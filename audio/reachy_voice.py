@@ -31,6 +31,19 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 SENTENCE_END_RE = re.compile(r"(?<=[.!?…])\s+")
 
+# Kokoro guesses names it doesn't know: it reads "Reachy" as "Ree-kee" (ɹˈiːki). These
+# spellings give the right sound ("Ree-chee", ɹˈiːtʃi). Only what is spoken changes, not
+# what is printed or logged.
+PRONUNCIATIONS = {
+    re.compile(r"\breachy\b", re.I): "Reechy",
+}
+
+
+def say_it_right(text: str) -> str:
+    for pattern, spoken in PRONUNCIATIONS.items():
+        text = pattern.sub(spoken, text)
+    return text
+
 
 class KokoroTTS:
     """Kokoro-82M (Apache 2.0) through kokoro-onnx.
@@ -53,7 +66,8 @@ class KokoroTTS:
         self.voice, self.speed = voice, speed
 
     def synth(self, text: str) -> tuple[np.ndarray, int]:
-        audio, sr = self._tts.create(text, voice=self.voice, speed=self.speed, lang="en-us")
+        audio, sr = self._tts.create(say_it_right(text), voice=self.voice, speed=self.speed,
+                                     lang="en-us")
         return audio.astype(np.float32), sr
 
 
@@ -157,7 +171,7 @@ class ReachyVoice:
     def __init__(self, voice: str = "auto",
                  kokoro_model: Optional[str] = None,
                  kokoro_voices: str = os.path.join(HERE, "models", "voices-v1.0.bin"),
-                 kokoro_voice: str = "af_heart", speed: float = 1.0,
+                 kokoro_voice: str = "am_fenrir", speed: float = 1.0,
                  say_voices: tuple = ("Ava (Premium)", "Zoe (Premium)", "Ava (Enhanced)", "Samantha"),
                  output_device=None):
         """voice: "auto" (Kokoro, else `say`), "kokoro", "say" or "none" (print only)."""
