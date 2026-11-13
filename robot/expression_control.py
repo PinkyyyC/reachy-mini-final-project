@@ -130,11 +130,29 @@ class ExpressionController:
 
             self.mini.play_move(motion_only, initial_goto_duration=0.5)
 
-            fill_move = self.library.get("attentive1")
-            fill_motion = RecordedMove(move=fill_move.move, sound_path=None)
-
-            while voice is not None and voice.speaking:
-                self.mini.play_move(fill_motion, initial_goto_duration=0.2)
-                time.sleep(0.05)
+            if voice is not None and voice.speaking:
+                self._play_filler_while_speaking(voice)
 
             self.current_expression = expression
+
+    def _play_filler_while_speaking(self, voice):
+        """Loop a gentle 'attentive' move while Reachy is still talking, and cut it off as
+        soon as the speech ends instead of finishing the 4 s move. Call with the lock held."""
+        fill_move = self.library.get("attentive1")
+        fill_motion = RecordedMove(move=fill_move.move, sound_path=None)
+        done = threading.Event()
+
+        def cancel_when_quiet():
+            while not done.wait(0.05):
+                if not voice.speaking:
+                    self.mini.cancel_move()
+                    return
+
+        watcher = threading.Thread(target=cancel_when_quiet, daemon=True)
+        watcher.start()
+        try:
+            while voice.speaking:
+                self.mini.play_move(fill_motion, initial_goto_duration=0.2)
+        finally:
+            done.set()
+            watcher.join()
