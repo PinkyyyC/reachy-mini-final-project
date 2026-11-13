@@ -2,6 +2,7 @@ import time
 import threading
 from reachy_mini import ReachyMini
 import cv2
+from collections import deque
 
 from decision.fusion import make_decision
 from decision.action_planner import ActionPlanner
@@ -41,6 +42,17 @@ class VisionPipelineThread:
             "doa": {"is_speech": False, "raw_deg": 90.0, "centered_deg": 0.0, "audio_side": "SILENT"},
             "cv": {},
         }
+        
+        # 新增：記憶「最近一次有效說話者」的狀態與時間戳記，解決 Whisper 延遲問題
+        self._last_active_speaker = "none"
+        self._last_looking_at_robot = False
+        self._last_target_norm_x = None
+        self._last_active_time = 0.0
+
+        # # 儲存最近 90 幀（約 3 秒）的歷史狀態：(timestamp, active_speaker, looking_at_robot, target_norm_x)
+        # self._history = deque(maxlen=90)
+        
+
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -54,9 +66,27 @@ class VisionPipelineThread:
 
             doa_state = self.doa_poller.get_state() if self.doa_poller else silent_doa
             fused = fuse_cv_and_doa(cv_state, doa_state)
+            now = time.time()
 
             with self._lock:
                 self._latest_fused = fused
+
+                # 只要偵測到有人正在說話，就刷新記憶緩衝區
+                if fused["active_speaker"] in ("person_left", "person_right"):
+                    self._last_active_speaker = fused["active_speaker"]
+                    self._last_looking_at_robot = fused["looking_at_robot"]
+                    self._last_target_norm_x = fused["target_norm_x"]
+                    self._last_active_time = now
+
+            
+                # # 只記錄確實有偵測到人在說話的影格
+                # if fused["active_speaker"] in ("person_left", "person_right"):
+                #     self._history.append((
+                #         now,
+                #         fused["active_speaker"],
+                #         fused["looking_at_robot"],
+                #         fused["target_norm_x"]
+                #     ))
 
             draw_fusion_hud(annotated_frame, fused)
             cv2.imshow("Reachy Multimodal Vision", annotated_frame)
@@ -72,6 +102,54 @@ class VisionPipelineThread:
         if self.doa_poller:
             self.doa_poller.stop()
         self.tracker.release()
+
+    def get_utterance_context(self, lookback_sec: float = 4.0) -> dict:
+        """
+        取得供 Turn-taking 決策使用的視覺狀態：
+        若當下嘴巴已閉上，則回溯過去 lookback_sec 秒內最後一位說話者的視線狀態。
+        """
+        with self._lock:
+            fused = dict(self._latest_fused)
+            # 如果當下已經沒人動嘴，但 2 秒內剛有人講完話，就套用那個人講話時的視線狀態
+            if fused["active_speaker"] == "none" and (time.time() - self._last_active_time <= lookback_sec):
+                fused["active_speaker"] = self._last_active_speaker
+                fused["looking_at_robot"] = self._last_looking_at_robot
+                fused["target_norm_x"] = self._last_target_norm_x
+                fused["confidence"] = "BUFFERED_SPEAKER"
+            return fused
+
+    # def get_utterance_context(self, lookback_sec: float = 2.5, gaze_ratio_threshold: float = 0.4) -> dict:
+    #     """
+    #     回溯過去 lookback_sec 秒內的所有說話影格：
+    #     1. 找出這段期間說話幀數最多的人作為 speaker。
+    #     2. 只要他在講話期間有超過 40% (gaze_ratio_threshold) 的時間看著機器人，就判定 looking_at_robot = True。
+    #     """
+    #     now = time.time()
+    #     with self._lock:
+    #         fused = dict(self._latest_fused)
+    #         recent_frames = [item for item in self._history if (now - item[0]) <= lookback_sec]
+
+    #     if not recent_frames:
+    #         return fused
+
+    #     # 統計這段期間誰說最多話
+    #     speakers = [f[1] for f in recent_frames]
+    #     dominant_speaker = max(set(speakers), key=speakers.count)
+
+    #     # 篩選出該說話者的影格，計算看機器人的比例與平均座標
+    #     speaker_frames = [f for f in recent_frames if f[1] == dominant_speaker]
+    #     gaze_true_count = sum(1 for f in speaker_frames if f[2] is True)
+    #     gaze_ratio = gaze_true_count / len(speaker_frames)
+
+    #     valid_norm_x = [f[3] for f in speaker_frames if f[3] is not None]
+    #     avg_norm_x = sum(valid_norm_x) / len(valid_norm_x) if valid_norm_x else None
+
+    #     fused["active_speaker"] = dominant_speaker
+    #     fused["looking_at_robot"] = (gaze_ratio >= gaze_ratio_threshold)
+    #     fused["target_norm_x"] = avg_norm_x
+    #     fused["confidence"] = f"BUFFERED_RATIO ({gaze_ratio:.0%})"
+
+    #     return fused
 
 def play_robot_response(voice: ReachyVoice, expression_controller: ExpressionController, text: str, emotion: str):
     """
@@ -175,50 +253,29 @@ def main():
 
                 #turn-taking
                 utt = nlp_status["utterance"]
-                # if utt:
-                #     print(f"\n[Heard] {utt['text']} (said_name: {utt['said_name']}, intent: {utt['intent']})")
-                # # 3. 取得 Vision 資訊 (真實環境中由你的視覺執行緒/模組取得)
-                # # vision_output = vision_module.get_latest()
                 
+
                 # if utt:
-                #     # 4. Multi-modal Fusion decision-making
+                #     print(f"\n[Heard #{utt['id']}] {utt['text']} "
+                #           f"(said_name={utt['said_name']}, cv_speaker={fused_cv['active_speaker']}, "
+                #           f"looking={fused_cv['looking_at_robot']})")
+
                 #     audio_output = {"utterance": utt}
-                    
-                #     # 帶入決策模組判斷是否該由機器人回話
-                #     # should_reply = make_decision(utt, vision_output)
-                #     # decision = make_decision(audio_output, vision_output)
-                #     # action = planner.process_decision(decision)
-                #     # speaker = vision_output.get("visual_active_speaker")
-                #     # looking = vision_output[speaker]["Looking_at_robot"] if speaker else False
-                    
-                #     should_reply = utt["said_name"] or utt["answering_robot"] # 或依據 action["should_speak"]  #or looking
-
-                #     if should_reply:
-                #         print(f"\n[Robot] Thinking response to: {utt['text']}")
-                        
-                #         # 5. trigger LLM to generate response and emotion (blocking)
-                #         reply = nlp.respond(utt["id"])
-                #         print(f"[Robot] Reply: {reply['text']} (Emotion: {reply['emotion']})")
-
-                #         # 6. 同步執行 Motion + TTS
-                #         play_robot_response(
-                #             voice=voice,
-                #             expression_controller=expression_controller,
-                #             text=reply["text"],
-                #             emotion=reply["emotion"]
-                #         )
-                #         planner.finish_speaking()
-
-                # time.sleep(0.1) #0.05
+                #     decision = make_decision(audio_output, fused_cv)
+                #     action = planner.process_decision(decision)
 
                 if utt:
+                    # 使用帶有 2 秒記憶緩衝的視覺狀態，避免因為閉嘴等待 Whisper 辨識而漏掉狀態
+                    utterance_cv = vision_pipeline.get_utterance_context(lookback_sec=2.0)
+
                     print(f"\n[Heard #{utt['id']}] {utt['text']} "
-                          f"(said_name={utt['said_name']}, cv_speaker={fused_cv['active_speaker']}, "
-                          f"looking={fused_cv['looking_at_robot']})")
+                          f"(said_name={utt['said_name']}, cv_speaker={utterance_cv['active_speaker']}, "
+                          f"looking={utterance_cv['looking_at_robot']})")
 
                     audio_output = {"utterance": utt}
-                    decision = make_decision(audio_output, fused_cv)
-                    action = planner.process_decision(decision)
+                    decision = make_decision(audio_output, utterance_cv)
+                    action = planner.process_decision(decision)    
+
 
                     print(f"[Decision] addressee={decision['addressee']} "
                           f"({decision['evidence']['addressee_method']}) -> should_speak={action['should_speak']}")
