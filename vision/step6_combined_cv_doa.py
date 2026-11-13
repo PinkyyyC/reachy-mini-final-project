@@ -16,7 +16,7 @@ class DoAPoller:
 
     def __init__(
         self,
-        robot_ip: str = "192.168.1.64",
+        robot_ip: str = "reachy-mini.local",
         left_Right_threshold_deg: float = 15.0,
         speech_hold_sec: float = 0.4,
         invert_left_right: bool = False,
@@ -198,7 +198,7 @@ if __name__ == "__main__":
     # =====================================================================
     # TUNABLE FUSION SETTINGS
     # =====================================================================
-    ROBOT_IP = "192.168.1.64"
+    ROBOT_IP = "reachy-mini.local"
     CAMERA_INDEX = 0
     DOA_SIDE_THRESHOLD_DEG = 15.0  # Degrees from center to count as LEFT or RIGHT
 

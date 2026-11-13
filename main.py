@@ -1,5 +1,6 @@
 import time
 import threading
+from reachy_mini import ReachyMini
 from robot.connection import NetworkReachyMini
 import cv2
 
@@ -27,7 +28,7 @@ EMOTION_MOVES = {
 
 class VisionPipelineThread:
     """Runs CV + DoA fusion continuously in a background thread at ~30 FPS."""
-    def __init__(self, camera_index: int = 0, robot_ip: str = "192.168.1.64", use_robot_doa: bool = False):
+    def __init__(self, camera_index: int = 0, robot_ip: str = "reachy-mini.local", use_robot_doa: bool = False):
         self.tracker = GazeAndLipTracker(camera_index=camera_index)
         self.doa_poller = DoAPoller(robot_ip=robot_ip) if use_robot_doa else None
         self._lock = threading.Lock()
@@ -136,7 +137,12 @@ def main():
     USE_REAL_ROBOT_HARDWARE = True
     ROBOT_IP = "reachy-mini.local"
 
-    with NetworkReachyMini(host=ROBOT_IP, connection_mode="network") as mini:
+    if USE_REAL_ROBOT_HARDWARE:
+        robot = NetworkReachyMini(host=ROBOT_IP, connection_mode="network")
+    else:
+        robot = ReachyMini()  # local simulator / daemon on this machine
+
+    with robot as mini:
         voice = ReachyVoice()
         # mic = None  # 若在沒有實體機器人/測試階段可暫時為 None
         
