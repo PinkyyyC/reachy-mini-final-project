@@ -3,12 +3,11 @@ import sys
 import time
 import threading
 import traceback
-from collections import deque
 from reachy_mini import ReachyMini
 from robot.connection import NetworkReachyMini
 import cv2
 
-from decision.fusion import make_decision, summarize_gaze
+from decision.fusion import make_decision
 from decision.action_planner import ActionPlanner
 from robot.expression_control import ExpressionController
 
@@ -39,7 +38,6 @@ class VisionPipelineThread:
         self._running = True
         self._latest_frame = None
         self._error = None
-        self._history = deque(maxlen=900)   # (time.time(), fused) for the last ~30 s at 30 FPS
         self._last_frame_t = None
         self._stall_reported = False
         self._latest_fused = {
@@ -83,7 +81,6 @@ class VisionPipelineThread:
             with self._lock:
                 self._latest_fused = fused
                 self._latest_frame = annotated_frame
-                self._history.append((time.time(), fused))
                 self._last_frame_t = time.monotonic()
 
     def show_preview(self):
@@ -114,12 +111,6 @@ class VisionPipelineThread:
     def get_latest(self) -> dict:
         with self._lock:
             return dict(self._latest_fused)
-
-    def gaze_during(self, start_t: float, end_t: float) -> dict:
-        """Who spoke and whether they looked at Reachy between two time.time() stamps."""
-        with self._lock:
-            frames = list(self._history)
-        return summarize_gaze(frames, start_t, end_t)
 
     def stop(self):
         self._running = False
@@ -178,7 +169,7 @@ def speak_reply(nlp: SpeakerNLPModel, voice: ReachyVoice, expression_controller:
         if first:
             state["first_sentence_t"] = time.time()
         print(f"[Robot] says: {sentence}")
-        voice.say(sentence, on_start=on_first_sound if first else None)
+        voice.say(sentence, on_start=on_first_sound if first else None, quick_start=first)
 
     try:
         reply = nlp.respond(utt["id"], on_sentence=on_sentence, on_emotion=on_emotion)
@@ -268,48 +259,97 @@ def run(use_real_robot: bool, camera_index: int = 0):
                 while not stop_event.is_set():
                     # Keep calling update() even while Reachy talks: it drops Reachy's own voice
                     # from the mic and starts the echo guard when Reachy stops.
+                    # update NLP status (about 10Hz)
                     nlp_status = nlp.update()
+                    # vision_output = vision_tracker.get_latest()
                     fused_cv = vision_pipeline.get_latest()
+                    # now = time.time()
                     replying = reply_thread is not None and reply_thread.is_alive()
 
                     # interrupting: True if user is speaking while robot is speaking
                     if nlp_status["interrupting"] and voice.speaking:
                         print("\n[Robot] Interrupted by user! Stopping speech...")
                         voice.stop()
+                        # motion stop?
 
-                    # While listening, the head follows whoever is speaking. Nods now happen at
-                    # the end of a statement made while looking at Reachy (see make_decision).
+                    # If the robot is not speaking, check if the user is speaking and if they are looking at the robot
+                    # gaze tracking the speaker + nodding
                     if not replying and not voice.speaking:
                         listening_action = planner.check_active_listening(fused_cv)
+
                         if listening_action["target_norm_x"] is not None:
                             expression_controller.look_at_norm_x(listening_action["target_norm_x"])
 
+                        if listening_action["should_nod"]:
+                            print(f"[Robot] Nodding to {fused_cv['active_speaker']}...")
+                            threading.Thread(
+                                target=expression_controller.play_quick_nod,
+                                daemon=True
+                            ).start()
+
+                    #turn-taking
                     utt = nlp_status["utterance"]
+                    # if utt:
+                    #     print(f"\n[Heard] {utt['text']} (said_name: {utt['said_name']}, intent: {utt['intent']})")
+                    # # 3. 取得 Vision 資訊 (真實環境中由你的視覺執行緒/模組取得)
+                    # # vision_output = vision_module.get_latest()
+                
+                    # if utt:
+                    #     # 4. Multi-modal Fusion decision-making
+                    #     audio_output = {"utterance": utt}
+                    
+                    #     # 帶入決策模組判斷是否該由機器人回話
+                    #     # should_reply = make_decision(utt, vision_output)
+                    #     # decision = make_decision(audio_output, vision_output)
+                    #     # action = planner.process_decision(decision)
+                    #     # speaker = vision_output.get("visual_active_speaker")
+                    #     # looking = vision_output[speaker]["Looking_at_robot"] if speaker else False
+                    
+                    #     should_reply = utt["said_name"] or utt["answering_robot"] # 或依據 action["should_speak"]  #or looking
+
+                    #     if should_reply:
+                    #         print(f"\n[Robot] Thinking response to: {utt['text']}")
+                        
+                    #         # 5. trigger LLM to generate response and emotion (blocking)
+                    #         reply = nlp.respond(utt["id"])
+                    #         print(f"[Robot] Reply: {reply['text']} (Emotion: {reply['emotion']})")
+
+                    #         # 6. 同步執行 Motion + TTS
+                    #         play_robot_response(
+                    #             voice=voice,
+                    #             expression_controller=expression_controller,
+                    #             text=reply["text"],
+                    #             emotion=reply["emotion"]
+                    #         )
+                    #         planner.finish_speaking()
+
+                    # time.sleep(0.1) #0.05
+
                     if utt:
                         heard_at = time.time()
-                        gaze = vision_pipeline.gaze_during(utt["t"], utt["end_t"])
                         print(f"\n[Heard #{utt['id']}] {utt['text']} "
-                              f"(intent={utt['intent']}, name_first={utt['name_first']}, "
-                              f"speaker={gaze['speaker']}, looking={gaze['looking_fraction']:.0%})")
+                              f"(said_name={utt['said_name']}, cv_speaker={fused_cv['active_speaker']}, "
+                              f"looking={fused_cv['looking_at_robot']})")
 
                         if replying:
+                            # Replies run in the background now (faster turn-taking), so a
+                            # sentence can arrive while Reachy is still answering the last one.
                             print("[Decision] Reachy is still replying; not answering this one")
                         else:
-                            decision = make_decision({"utterance": utt}, gaze)
-                            planner.process_decision(decision)
-                            print(f"[Decision] {decision['action']} "
-                                  f"({decision['evidence']['addressee_method']})")
+                            audio_output = {"utterance": utt}
+                            decision = make_decision(audio_output, fused_cv)
+                            action = planner.process_decision(decision)
 
-                            if decision["action"] == "speak":
-                                # face the speaker before replying
+                            print(f"[Decision] addressee={decision['addressee']} "
+                                  f"({decision['evidence']['addressee_method']}) -> should_speak={action['should_speak']}")
+
+                            if action["should_speak"]:
+                                # face the spaeker before replying
                                 if decision["target_norm_x"] is not None:
                                     expression_controller.look_at_norm_x(decision["target_norm_x"])
                                 reply_thread = threading.Thread(
                                     target=run_reply, args=(utt, heard_at), daemon=True)
                                 reply_thread.start()
-                            elif decision["action"] == "nod":
-                                threading.Thread(target=expression_controller.play_quick_nod,
-                                                 daemon=True).start()
 
                     time.sleep(0.05)  # ~20Hz main loop freq
 

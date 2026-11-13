@@ -122,12 +122,20 @@ class Config:
     silero_threshold: float = 0.5        # speech probability per 32 ms frame
     vad_rms: float = 0.012               # loudness threshold for "energy" (and silero's floor)
     silence_end_s: float = 0.4           # pause that ends a sentence
+    long_silence_s: float = 1.0          # pause allowed instead, when the words so far look
+                                         # unfinished ("It's just", "because", 1-2 words)
+    verdict_grace_s: float = 0.2         # extra wait if that check isn't back after silence_end_s
+    early_silence_s: float = 0.15        # pause after which transcription starts early, in case
+                                         # the sentence is over (reused if it is, dropped if not)
+    preroll_s: float = 0.25              # audio kept from just before speech starts, so the
+                                         # first word ("Reachy, ...") isn't clipped
     min_utterance_s: float = 0.35
     max_utterance_s: float = 15.0
     unfinished_wait_s: float = 0.8       # "...is nice because" -> wait this long for the rest
 
     # Speech-to-text.
     stt_model: str = "base.en"           # "tiny.en" is faster, "small.en" more accurate
+    stt_device: str = "auto"             # "auto": Apple GPU (about 2x faster), else CPU; or "cpu"
 
     # While Reachy talks.
     echo_guard_s: float = 0.5            # ignore the mic this long after Reachy stops talking
@@ -305,20 +313,57 @@ def make_vad(cfg: Config):
 
 
 class UtteranceSegmenter:
-    """Cuts the microphone stream into sentences, using the speech detector and a pause."""
+    """Cuts the microphone stream into sentences, using the speech detector and a pause.
+
+    feed() returns the sentence's audio once the pause reaches silence_end_s. Earlier, at
+    early_silence_s, the audio so far is offered through pop_early() so it can be transcribed
+    while we wait to be sure the sentence is over. final_matches_early then says whether the
+    final sentence is the same audio (nobody spoke again), so that early transcript can be used.
+    """
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
+        self._preroll: collections.deque = collections.deque()
         self.reset()
         self._last_voice_t = 0.0
         self._start_t = 0.0
         self.last_start_t = 0.0          # when the sentence just returned began
         self.last_end_t = 0.0            # ...and when its last voiced audio was heard
+        self.final_matches_early = False
+        self.last_waited = False         # the sentence just returned was given the longer pause
+        self._early_seq = 0
 
     def reset(self) -> None:
         self._buf: list[np.ndarray] = []
         self._voiced_s = 0.0
         self.in_speech = False
+        self._early_taken = False
+        self._early: Optional[np.ndarray] = None
+        self._verdict: Optional[bool] = None   # early words look finished? None: not known yet
+
+    @property
+    def early_seq(self) -> int:
+        """Which early snapshot pop_early() last gave out (to match its transcript later)."""
+        return self._early_seq
+
+    def set_early_verdict(self, seq: int, finished: bool) -> None:
+        """The early transcript of snapshot `seq` looks finished or not. Ignored if the person
+        has spoken again since (that snapshot is stale)."""
+        if self._early_taken and seq == self._early_seq:
+            self._verdict = finished
+
+    def _pause_needed(self) -> float:
+        if not self._early_taken:
+            return self.cfg.silence_end_s
+        if self._verdict is False:                       # "It's just", "because": wait for more
+            return self.cfg.long_silence_s
+        if self._verdict is None:                        # check not back yet: a little longer
+            return self.cfg.silence_end_s + self.cfg.verdict_grace_s
+        return self.cfg.silence_end_s
+
+    def pop_early(self) -> Optional[np.ndarray]:
+        early, self._early = self._early, None
+        return early
 
     def feed(self, chunk: np.ndarray, now: float, voiced: Optional[bool] = None) -> Optional[np.ndarray]:
         loud = rms(chunk) > self.cfg.vad_rms if voiced is None else voiced
@@ -326,25 +371,48 @@ class UtteranceSegmenter:
             self._last_voice_t = now
             if not self.in_speech:
                 self._start_t = now
+                self._buf = list(self._preroll)      # the moment just before speech started
+                self._preroll.clear()
             self.in_speech = True
+            self._early_taken = False                # speaking again: the early audio is stale
+            self._verdict = None
         if not self.in_speech:
+            self._keep_preroll(chunk)
             return None
         self._buf.append(chunk)
         if loud:
             self._voiced_s += len(chunk) / self.cfg.sample_rate
         total_s = sum(len(b) for b in self._buf) / self.cfg.sample_rate
-        if now - self._last_voice_t >= self.cfg.silence_end_s or total_s >= self.cfg.max_utterance_s:
+        silence_s = now - self._last_voice_t
+        if silence_s >= self._pause_needed() or total_s >= self.cfg.max_utterance_s:
             audio, voiced_s = np.concatenate(self._buf), self._voiced_s
             self.last_start_t = self._start_t
             self.last_end_t = self._last_voice_t
+            self.final_matches_early = self._early_taken
+            self.last_waited = self._verdict is False
             self.reset()
             if voiced_s >= self.cfg.min_utterance_s:
                 return audio
+            return None
+        if (not self._early_taken and silence_s >= self.cfg.early_silence_s
+                and self._voiced_s >= self.cfg.min_utterance_s):
+            self._early_taken = True
+            self._early_seq += 1
+            self._early = np.concatenate(self._buf)
         return None
+
+    def _keep_preroll(self, chunk: np.ndarray) -> None:
+        self._preroll.append(chunk)
+        max_len = int(self.cfg.preroll_s * self.cfg.sample_rate)
+        while len(self._preroll) > 1 and sum(len(c) for c in self._preroll) - len(self._preroll[0]) >= max_len:
+            self._preroll.popleft()
 
 
 class Transcriber:
-    """faster-whisper in a background thread, so update() never waits for it."""
+    """faster-whisper in a background thread, so update() never waits for it.
+
+    submit(job_id, audio) queues audio; results gets (job_id, text) when it's done.
+    """
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -356,25 +424,49 @@ class Transcriber:
 
         threading.Thread(target=self._loop, args=(WhisperModel,), daemon=True).start()
 
-    def submit(self, audio: np.ndarray, side: Optional[str], start_t: float, end_t: float,
-               interrupting: bool) -> None:
-        self._in.put((audio, side, start_t, end_t, interrupting))
+    def submit(self, job_id: int, audio: np.ndarray) -> None:
+        self._in.put((job_id, audio))
+
+    def _devices(self) -> list[tuple[str, str]]:
+        if self.cfg.stt_device == "auto":
+            import platform
+            on_apple_gpu = sys.platform == "darwin" and platform.machine() == "arm64"
+            return ([("mps", "float16")] if on_apple_gpu else []) + [("cpu", "int8")]
+        return [(self.cfg.stt_device, "float16" if self.cfg.stt_device != "cpu" else "int8")]
+
+    def _load(self, WhisperModel, devices):
+        # The first run downloads the model (about 150 MB for base.en).
+        for i, (device, compute_type) in enumerate(devices):
+            try:
+                model = WhisperModel(self.cfg.stt_model, device=device, compute_type=compute_type)
+                print(f"[nlp] speech-to-text ready ({self.cfg.stt_model} on {device})")
+                return model, devices[i + 1:]
+            except Exception as e:   # noqa: BLE001 - e.g. no Apple GPU support in this build
+                print(f"[nlp] speech-to-text on {device} unavailable ({e})")
+        raise RuntimeError("speech-to-text could not start on any device")
 
     def _loop(self, WhisperModel) -> None:
-        # The first run downloads the model (about 150 MB for base.en).
-        model = WhisperModel(self.cfg.stt_model, device="cpu", compute_type="int8")
-        print(f"[nlp] speech-to-text ready ({self.cfg.stt_model})")
+        model, fallbacks = self._load(WhisperModel, self._devices())
         while True:
-            audio, side, start_t, end_t, interrupting = self._in.get()
-            # No vad_filter: Silero already cut this sentence, so a second pass only costs time.
-            segments, _ = model.transcribe(
-                audio, language="en", beam_size=1, vad_filter=False, without_timestamps=True,
-                condition_on_previous_text=False,
-                hotwords="Reachy " + " ".join(self.cfg.task_items),   # nudges "Richie" -> "Reachy"
-            )
-            text = " ".join(s.text.strip() for s in segments).strip()
-            if text:
-                self.results.put((text, side, start_t, end_t, interrupting))
+            job_id, audio = self._in.get()
+            try:
+                text = self._transcribe(model, audio)
+            except Exception as e:   # noqa: BLE001 - the experimental Apple GPU backend failed
+                if not fallbacks:
+                    raise
+                print(f"[nlp] speech-to-text failed ({e}); switching to {fallbacks[0][0]}")
+                model, fallbacks = self._load(WhisperModel, fallbacks)
+                text = self._transcribe(model, audio)
+            self.results.put((job_id, text))
+
+    def _transcribe(self, model, audio: np.ndarray) -> str:
+        # No vad_filter: Silero already cut this sentence, so a second pass only costs time.
+        segments, _ = model.transcribe(
+            audio, language="en", beam_size=1, vad_filter=False, without_timestamps=True,
+            condition_on_previous_text=False,
+            hotwords="Reachy " + " ".join(self.cfg.task_items),   # nudges "Richie" -> "Reachy"
+        )
+        return " ".join(s.text.strip() for s in segments).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -384,11 +476,8 @@ class Transcriber:
 # Whisper often mishears the robot's name; these spellings are rewritten to "Reachy".
 # "Rachel" is a real name: drop it from this list if a participant is called Rachel.
 MISHEARD_NAME_RE = re.compile(
-    r"\b(reachie|reechy|reachi|reeky|reiki|reaky|richie|ritchie|richy|ricci|rachel)\b", re.I)
+    r"\b(reachie|reechy|reachi|reeky|reiki|riki|reaky|richie|ritchie|richy|ricci|rachel)\b", re.I)
 NAME_RE = re.compile(r"\b(reachy|reach me|robot)\b", re.I)
-# The name opens the sentence, optionally after a greeting: "Reachy, ...", "Hey Reachy, ...".
-NAME_FIRST_RE = re.compile(
-    r"^\W*((hi|hey|hello|yo|oh|ok(ay)?|so|um|uh|excuse me)\W+)*(reachy|robot)\b", re.I)
 QUESTION_START_RE = re.compile(
     r"^((hey|hi|so|and|but|ok(ay)?|reachy)\W+)*"
     r"(what|why|how|which|who|where|when|should|could|would|do|does|did|is|are|can|shall|will)\b",
@@ -399,12 +488,25 @@ UNFINISHED_RE = re.compile(
     r"\W*$", re.I)
 
 
+def looks_unfinished(text: str) -> bool:
+    """Words that probably aren't a whole sentence yet: "It's just", "because the", "first".
+
+    A question, or a short call like "Hi Reachy", counts as finished.
+    """
+    clean = MISHEARD_NAME_RE.sub("Reachy", text.strip())
+    if not clean or clean.endswith("?"):
+        return False
+    words = re.findall(r"[A-Za-z']+", clean)
+    if NAME_RE.search(clean) and len(words) <= 3:      # "Hi Reachy", "Reachy!"
+        return False
+    return bool(UNFINISHED_RE.search(clean)) or len(words) < 3
+
+
 def classify_utterance(text: str) -> dict:
     clean = MISHEARD_NAME_RE.sub("Reachy", text.strip())
     is_question = clean.rstrip().endswith("?") or bool(QUESTION_START_RE.match(clean))
     return {"text": clean, "intent": "question" if is_question else "statement",
-            "said_name": bool(NAME_RE.search(clean)),
-            "name_first": bool(NAME_FIRST_RE.match(clean))}
+            "said_name": bool(NAME_RE.search(clean))}
 
 
 # ---------------------------------------------------------------------------
@@ -883,6 +985,12 @@ class SpeakerNLPModel:
         self._prebuffer: collections.deque = collections.deque(maxlen=8)   # ~0.8 s of audio
         self._replied: Optional[tuple[int, str]] = None
         self._reply_active = False               # a streamed reply is being spoken
+        self._next_job = 1                       # speech-to-text jobs (see _listen)
+        self._early_job: Optional[int] = None    # transcribing the sentence before it's over
+        self._early_job_seq = 0                  # ...of this segmenter snapshot
+        self._job_text: dict[int, str] = {}      # finished, not yet known to be final
+        self._job_meta: dict[int, tuple] = {}    # final, waiting for the text
+        self._ready: collections.deque = collections.deque()
         self._log_file = self._log = self._conv_file = self._conv = None
 
     # -- lifecycle --------------------------------------------------------
@@ -907,7 +1015,7 @@ class SpeakerNLPModel:
     def inject_transcript(self, text: str, side: Optional[str] = None) -> None:
         """Typed input for testing without a microphone."""
         now = time.monotonic()
-        self._typed.put((text, side, now, now, self._robot_speaking()))
+        self._typed.put((text, side, now, now, self._robot_speaking(), False))
 
     # -- the two calls the controller uses --------------------------------
 
@@ -1003,49 +1111,93 @@ class SpeakerNLPModel:
             self._prebuffer.clear()
 
     def _listen(self, audio: np.ndarray, voiced: bool, side: Optional[str], now: float) -> None:
+        self._collect_transcripts()                  # an early transcript may decide the pause
         if side is not None:
             self._sides.append(side)
         sentence = self.segmenter.feed(audio, now, voiced)
+        early = self.segmenter.pop_early()
+        if early is not None:
+            # A short pause: start transcribing now, in case the sentence is over.
+            self._early_job = self._submit(early)
+            self._early_job_seq = self.segmenter.early_seq
         if sentence is not None:
             sides = [s for s in self._sides if s is not None]
             majority = max(set(sides), key=sides.count) if sides else None
-            self.transcriber.submit(sentence, majority, self.segmenter.last_start_t,
-                                    self.segmenter.last_end_t, self._capturing)
+            if self.segmenter.final_matches_early and self._early_job is not None:
+                job = self._early_job                # nobody spoke again: reuse it
+            else:
+                job = self._submit(sentence)
+            self._early_job = None
+            self._finalize(job, (majority, self.segmenter.last_start_t,
+                                 self.segmenter.last_end_t, self._capturing,
+                                 self.segmenter.last_waited))
             self._sides = []
         if self._capturing and not self.segmenter.in_speech:
             self._capturing = False
 
+    def _submit(self, audio: np.ndarray) -> int:
+        job, self._next_job = self._next_job, self._next_job + 1
+        self.transcriber.submit(job, audio)
+        return job
+
+    def _finalize(self, job: int, meta: tuple) -> None:
+        """The sentence is over and `job` transcribes it. Older unfinished jobs are stale."""
+        for stale in [j for j in self._job_text if j < job]:
+            del self._job_text[stale]
+        if job in self._job_text:
+            self._deliver(self._job_text.pop(job), meta)
+        else:
+            self._job_meta[job] = meta
+
+    def _deliver(self, text: str, meta: tuple) -> None:
+        if text:
+            side, start_t, end_t, interrupting, waited = meta
+            self._ready.append((text, side, start_t, end_t, interrupting, waited))
+
+    def _collect_transcripts(self) -> None:
+        while self.transcriber is not None and not self.transcriber.results.empty():
+            job, text = self.transcriber.results.get_nowait()
+            if job in self._job_meta:
+                self._deliver(text, self._job_meta.pop(job))
+            elif job == self._early_job:
+                self._job_text[job] = text           # early: we'll know soon if it's final
+                self.segmenter.set_early_verdict(self._early_job_seq, not looks_unfinished(text))
+            # else: an early transcript of a sentence that went on; not needed
+
     def _next_transcript(self):
-        for q in (self._typed, self.transcriber.results if self.transcriber else None):
-            if q is not None and not q.empty():
-                return q.get_nowait()
-        return None
+        if not self._typed.empty():
+            return self._typed.get_nowait()
+        self._collect_transcripts()
+        return self._ready.popleft() if self._ready else None
 
     def _join_unfinished(self, item, now: float):
         """Hold "I think Japan is nice because" until the rest of the sentence arrives.
 
-        item: (text, side, start_t, end_t, interrupting). A sentence ending in "?" is never
-        held: it's finished, and waiting would only delay Reachy's answer.
+        item: (text, side, start_t, end_t, interrupting, waited). A sentence ending in "?" is
+        never held: it's finished, and waiting would only delay Reachy's answer. Nor is one that
+        already got the longer pause while it was being recorded (waited).
         """
         if self.segmenter.in_speech:
             self._last_in_speech_t = now
         held = self._held
         if item is not None and held is not None:
             self._held = None
-            return (f"{held[0]} {item[0]}", held[1] or item[1], held[2], item[3], held[4] or item[4])
-        if item is not None and UNFINISHED_RE.search(item[0]) and not item[0].rstrip().endswith("?"):
+            return (f"{held[0]} {item[0]}", held[1] or item[1], held[2], item[3], held[4] or item[4],
+                    item[5])
+        if (item is not None and not item[5] and UNFINISHED_RE.search(item[0])
+                and not item[0].rstrip().endswith("?")):
             self._held = (*item, now)
             return None
-        if held is not None and now - max(held[5], self._last_in_speech_t) > self.cfg.unfinished_wait_s:
+        if held is not None and now - max(held[6], self._last_in_speech_t) > self.cfg.unfinished_wait_s:
             self._held = None
-            return held[:5]
+            return held[:6]
         return item
 
     def _next_utterance(self, now: float) -> Optional[dict]:
         item = self._join_unfinished(self._next_transcript(), now)
         if item is None:
             return None
-        text, side, start_t, end_t, interrupting = item
+        text, side, start_t, end_t, interrupting, _ = item
         c = classify_utterance(text)
         with self._lock:
             answering = self._answer_expected(start_t)

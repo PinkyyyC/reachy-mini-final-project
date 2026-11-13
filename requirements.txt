@@ -13,7 +13,7 @@ anthropic==2.8.0             # Claude (needs ANTHROPIC_API_KEY in audio/.env)
 ollama==0.6.3                # optional free local replies (needs the Ollama app)
 
 # Voice
-kokoro-onnx==0.6.1           # needs audio/models/kokoro-v1.0.int8.onnx and voices-v1.0.bin
+kokoro-onnx==0.6.1           # needs audio/models/voices-v1.0.bin and kokoro-v1.0.onnx (fastest, 326 MB) or kokoro-v1.0.int8.onnx (92 MB), from github.com/thewh1teagle/kokoro-onnx releases (model-files-v1.0)
 
 # Vision: OpenCV + MediaPipe face mesh
 opencv-contrib-python==5.0.0.93   # don't also install opencv-python

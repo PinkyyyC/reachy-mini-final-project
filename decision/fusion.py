@@ -1,6 +1,5 @@
 
 # import math
-from collections import Counter
 
 
 
@@ -218,95 +217,65 @@ def detect_addressee(
 
 
 
-PEOPLE = ("person_left", "person_right")
-LOOKING_FRACTION = 0.5     # looking at Reachy for at least half of the sentence counts
-GAZE_PAD_S = 0.3           # frames this close to the sentence's start/end also count
-
-
-def summarize_gaze(frames, start_t: float, end_t: float) -> dict:
-    """Who spoke, and were they looking at Reachy, over the time the sentence was said.
-
-    frames: [(time.time(), fused_cv_state), ...] recorded by the vision thread.
-    The speaker is whoever the lips + DoA fusion picked most often. If it never picked
-    anyone but only one face was in view, that face is the speaker.
+def make_decision(audio_output: dict, fused_cv_state: dict) -> dict:
     """
-    window = [f for t, f in frames if start_t - GAZE_PAD_S <= t <= end_t + GAZE_PAD_S]
-    summary = {"frames": len(window), "speaker": "unknown", "speaker_method": "none",
-               "looking_at_robot": False, "looking_fraction": 0.0, "target_norm_x": None}
-    if not window:
-        return summary
-
-    votes = Counter(f.get("active_speaker") for f in window if f.get("active_speaker") in PEOPLE)
-    if votes:
-        speaker, method = votes.most_common(1)[0][0], "lips_doa"
-    else:
-        faces_seen = {slot for f in window for slot in (f.get("cv") or {}) if slot in PEOPLE}
-        if len(faces_seen) != 1:
-            return summary
-        speaker, method = faces_seen.pop(), "only_face"
-    summary.update(speaker=speaker, speaker_method=method)
-
-    faces = [f["cv"][speaker] for f in window if speaker in (f.get("cv") or {})]
-    if faces:
-        fraction = sum(bool(face.get("looking_at_robot")) for face in faces) / len(faces)
-        summary.update(looking_fraction=round(fraction, 2),
-                       looking_at_robot=fraction >= LOOKING_FRACTION,
-                       target_norm_x=faces[-1].get("norm_x"))
-    return summary
-
-
-def make_decision(audio_output: dict, gaze: dict) -> dict:
-    """Decide what Reachy does with a finished sentence: "speak", "nod" or "none".
-
-    Reachy speaks when:
-      1. the person is answering a question Reachy just asked, or
-      2. they said "Reachy" at the start of the sentence ("Reachy, ...", "Hi Reachy, ..."), or
-      3. they looked at Reachy while asking a question.
-    Looking at Reachy while making a statement gets a nod. Otherwise Reachy stays quiet.
-
+    Combine NLP utterance metadata with CV+DoA fused state.
+    
     Args:
         audio_output: {"utterance": dict} from SpeakerNLPModel
-        gaze: summarize_gaze() over the time the sentence was said
+        fused_cv_state: output dictionary from fuse_cv_and_doa(cv_state, doa_state)
     """
     utterance = audio_output.get("utterance", {})
     said_name = utterance.get("said_name", False)
-    name_first = utterance.get("name_first", False)
     answering_robot = utterance.get("answering_robot", False)
-    is_question = utterance.get("intent") == "question"
 
-    speaker = gaze.get("speaker", "unknown")
-    looking_at_robot = bool(gaze.get("looking_at_robot", False))
+    # 1. Identify speaker from CV + DoA fusion
+    active_speaker = fused_cv_state.get("active_speaker", "none")
+    speaker = active_speaker if active_speaker in ("person_left", "person_right") else "unknown"
+    speaker_confidence = fused_cv_state.get("confidence", "NONE")
+
+    # 2. Detect addressee (Robot vs Partner)
+    # Priority: answering_robot > said_name > visual gaze (looking_at_robot)
+    looking_at_robot = fused_cv_state.get("looking_at_robot", False)
 
     if answering_robot:
-        action, addressee, method = "speak", "robot", "answering_robot"
-    elif name_first:
-        action, addressee, method = "speak", "robot", "name_first"
-    elif speaker in PEOPLE and looking_at_robot and is_question:
-        action, addressee, method = "speak", "robot", "looking_and_question"
-    elif speaker in PEOPLE and looking_at_robot:
-        action, addressee, method = "nod", "robot", "looking_and_statement"
-    elif speaker in PEOPLE:
-        action, addressee, method = "none", "human", "looking_away"
+        addressee = "robot"
+        addressee_confidence = 1.0
+        addressee_method = "answering_robot"
+    elif said_name:
+        addressee = "robot"
+        addressee_confidence = 0.95
+        addressee_method = "said_name"
+    elif speaker != "unknown":
+        if looking_at_robot:
+            addressee = "robot"
+            addressee_confidence = 0.85
+            addressee_method = "gaze_and_lips"
+        else:
+            addressee = "human"
+            addressee_confidence = 0.80
+            addressee_method = "gaze_and_lips"
     else:
-        action, addressee, method = "none", "unknown", "insufficient_evidence"
+        addressee = "unknown"
+        addressee_confidence = 0.0
+        addressee_method = "insufficient_evidence"
+
+    should_speak = (addressee == "robot")
 
     return {
         "utterance_id": utterance.get("id"),
         "speaker": speaker,
-        "speaker_method": gaze.get("speaker_method", "none"),
+        "speaker_confidence": speaker_confidence,
         "addressee": addressee,
-        "action": action,
-        "should_speak": action == "speak",
-        "should_nod": action == "nod",
-        "target_norm_x": gaze.get("target_norm_x"),
+        "addressee_confidence": addressee_confidence,
+        "should_speak": should_speak,
+        "target_norm_x": fused_cv_state.get("target_norm_x"),
         "intent": utterance.get("intent"),
         "text": utterance.get("text"),
         "evidence": {
-            "addressee_method": method,
+            "addressee_method": addressee_method,
             "said_name": said_name,
-            "name_first": name_first,
             "answering_robot": answering_robot,
             "looking_at_robot": looking_at_robot,
-            "looking_fraction": gaze.get("looking_fraction", 0.0),
-        },
+        }
     }
