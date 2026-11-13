@@ -106,6 +106,7 @@ class YawOffsetMove(Move):
             head = self._rot_4x4 @ head
 
         return head, antennas, body_yaw
+    
 
 class ExpressionController:
     def __init__(self, mini):
@@ -135,17 +136,24 @@ class ExpressionController:
         pose = create_head_pose(yaw=target_yaw, degrees=True)
         self.mini.set_target(head=pose)
 
+    # def _get_offset_move(self, move_name: str) -> YawOffsetMove:
+    #     """ Get action with current head rotation offset """
+    #     raw_move = self.library.get(move_name)
+    #     return YawOffsetMove(raw_move.move, yaw_offset_deg=self._current_yaw_deg)
     def _get_offset_move(self, move_name: str) -> YawOffsetMove:
-        """ Get action with current head rotation offset """
+        """取得加上當前頭轉角偏移的動作"""
         raw_move = self.library.get(move_name)
-        return YawOffsetMove(raw_move.move, yaw_offset_deg=self._current_yaw_deg)
+        # 先建立不含內建音效的 RecordedMove（它本身就是一個合法的 Move 物件）
+        motion_only = RecordedMove(move=raw_move.move, sound_path=None)
+        # 再將 motion_only 傳入 YawOffsetMove
+        return YawOffsetMove(motion_only, yaw_offset_deg=self._current_yaw_deg)
     
     def play_quick_nod(self):
         """Non-blocking friendly backchannel nod ('understanding1') while listening."""
         if self._motion_lock.locked():
             return
         with self._motion_lock:
-            offset_nod = self._get_offset_move("understanding1")
+            offset_nod = self._get_offset_move("understanding2")
             self.mini.play_move(offset_nod, initial_goto_duration=0.25)
 
     def play(self, expression: str, voice=None):
