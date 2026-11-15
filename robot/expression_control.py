@@ -83,13 +83,29 @@ class ExpressionController:
         # pass motion_only into YawOffsetMove
         return YawOffsetMove(motion_only, yaw_offset_deg=self._current_yaw_deg)
     
+    # Listening "nod" made with the antennas only (see play_quick_nod)
+    ANTENNA_FLICK_DEG = 25.0      # how far each antenna flicks out
+    ANTENNA_FLICK_S = 0.45        # one flick out and back
+    ANTENNA_FLICKS = 2            # number of flicks
+
     def play_quick_nod(self):
-        """Non-blocking friendly backchannel nod ('understanding2') while listening."""
+        """Friendly backchannel while listening: both antennas flick out and back twice
+        (about 0.9 s). The head and body don't move."""
         if self._motion_lock.locked():
             return
         with self._motion_lock:
-            offset_nod = self._get_offset_move("understanding2")
-            self.mini.play_move(offset_nod, initial_goto_duration=0.25)
+            rest = list(self.mini.get_present_antenna_joint_positions())
+            amplitude = np.deg2rad(self.ANTENNA_FLICK_DEG)
+            total_s = self.ANTENNA_FLICK_S * self.ANTENNA_FLICKS
+            start = time.monotonic()
+            while (t := time.monotonic() - start) < total_s:
+                # smooth bump 0 -> amplitude -> 0 for each flick
+                phase = (t % self.ANTENNA_FLICK_S) / self.ANTENNA_FLICK_S
+                bump = amplitude * np.sin(np.pi * phase) ** 2
+                # mirrored, so both antennas open outward together (left -, right +)
+                self.mini.set_target_antenna_joint_positions([rest[0] - bump, rest[1] + bump])
+                time.sleep(0.02)
+            self.mini.set_target_antenna_joint_positions(rest)
 
     def play(self, expression: str, voice=None):
         if expression not in EXPRESSION_MAP:
