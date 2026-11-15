@@ -13,12 +13,14 @@ EXPRESSION_TO_MOTION = {
 
 
 class ActionPlanner:
-    def __init__(self, nod_cooldown_sec: float = 3.5):
+    def __init__(self, nod_cooldown_sec: float = 8.0):
         self.state = "IDLE"
         self.nod_cooldown_sec = nod_cooldown_sec
         self._last_nod_time = 0.0
-        self._gaze_start_time = None
-        self._last_gaze_speaker = None
+        # self._gaze_start_time = None
+        # self._last_gaze_speaker = None
+        self._speech_start_time = None
+        self._last_speech_seen_time = 0.0
 
     def check_active_listening(self, fused_cv_state: dict) -> dict:
         """
@@ -32,18 +34,38 @@ class ActionPlanner:
 
         should_nod = False
 
-        if active_speaker in ("person_left", "person_right") and looking_at_robot:
-            # Track how long this person has been speaking while looking at the robot
-            if self._last_gaze_speaker != active_speaker:
-                self._last_gaze_speaker = active_speaker
-                self._gaze_start_time = now
-            elif (now - self._gaze_start_time >= 1.2) and (now - self._last_nod_time >= self.nod_cooldown_sec):
-                # Trigger an understanding nod after 1.2s of sustained eye contact while speaking
+        # if active_speaker in ("person_left", "person_right") and looking_at_robot:
+        #     # Track how long this person has been speaking while looking at the robot
+        #     if self._last_gaze_speaker != active_speaker:
+        #         self._last_gaze_speaker = active_speaker
+        #         self._gaze_start_time = now
+        #     elif (now - self._gaze_start_time >= 0.8) and (now - self._last_nod_time >= self.nod_cooldown_sec):
+        #         # Trigger an understanding nod after 0.8s of sustained eye contact while speaking
+        #         should_nod = True
+        #         self._last_nod_time = now
+        # else:
+        #     self._last_gaze_speaker = None
+        #     self._gaze_start_time = None
+
+        # return {
+        #     "target_norm_x": target_norm_x if active_speaker != "none" else None,
+        #     "should_nod": should_nod,
+        # }
+
+        if active_speaker in ("person_left", "person_right"):
+            self._last_speech_seen_time = now
+
+            # Start tracking continuous listening if not already active
+            if self._speech_start_time is None:
+                self._speech_start_time = now
+            # Nod once people have been talking for at least 1.2s AND cooldown has passed
+            elif (now - self._speech_start_time >= 1.2) and (now - self._last_nod_time >= self.nod_cooldown_sec):
                 should_nod = True
                 self._last_nod_time = now
         else:
-            self._last_gaze_speaker = None
-            self._gaze_start_time = None
+            # Allow up to 1.5s of brief pause/turn-switching between speakers without resetting
+            if (now - self._last_speech_seen_time) > 1.5:
+                self._speech_start_time = None
 
         return {
             "target_norm_x": target_norm_x if active_speaker != "none" else None,

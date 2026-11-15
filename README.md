@@ -122,6 +122,17 @@ It connects to `reachy-mini.local`. A camera window opens with the tracking over
 it or press `q` to stop. If the wrong camera opens (for example an iPhone through Continuity
 Camera), pick another one with `--camera 1`.
 
+Experiment conditions (--mode):
+`main.py` accept --mode to switch between the experimental system and the study baseline:
+
+--mode multimodal (default): Reachy tracks the active speaker's head position, nods while listening, and turns toward the speaker before replying.
+
+--mode baseline: Reachy randomly shifts its gaze between participants every 2.5–5.0 s instead of following the speaker (turn-taking and reply triggers remain unchanged).
+
+```bash
+.venv/bin/python main.py --mode baseline
+```
+
 ### In the simulator
 
 1. Quit the **Reachy Mini Control** app if it's open. It runs its own simulator on the same
@@ -135,6 +146,8 @@ Camera), pick another one with `--camera 1`.
    ```bash
    .venv/bin/python main_sim.py
    ```
+  Experiment conditions (--mode):
+  `main_sim.py` also accept --mode to switch between the experimental system and the study baseline
 
 `main_sim.py` says which simulator it found. The simulator has no sound-direction sensor, so
 the speaker is worked out from the camera alone. For a lighter simulator without the 3D view,

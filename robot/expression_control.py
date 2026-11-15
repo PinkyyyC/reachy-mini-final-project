@@ -19,67 +19,6 @@ EXPRESSION_MAP = {
 }
 
 
-
-
-# class ExpressionController:
-
-#     def __init__(self, mini):
-#         self.mini = mini
-#         self.library = RecordedMoves(DATASET)
-#         self.current_expression = None
-
-#     # def play(self, expression: str, target_duration: float = None):
-#     #     if expression not in EXPRESSION_MAP:
-#     #         print(f"Unknown expression: {expression}")
-#     #         return
-
-#     #     move_name = EXPRESSION_MAP[expression]
-#     #     move = self.library.get(move_name)
-#     #     motion_only = RecordedMove(move=move.move, sound_path=None)
-
-#     #     start_time = time.time()
-        
-#     #     # 1. 先播放主表情動作
-#     #     self.mini.play_move(motion_only, initial_goto_duration=0.5)
-
-#     #     # 2. 如果語音時間還沒到，持續做自然的節奏性說話小動作 (例如微點頭)
-#     #     if target_duration:
-#     #         elapsed = time.time() - start_time
-#     #         remaining = target_duration - elapsed
-            
-#     #         # 若剩餘時間超過 1 秒，循環播放短的自然微動動作 (如 attentive 或 nod)
-#     #         while remaining > 0.8:
-#     #             fill_move = self.library.get("attentive1")
-#     #             fill_motion = RecordedMove(move=fill_move.move, sound_path=None)
-#     #             self.mini.play_move(fill_motion, initial_goto_duration=0.2)
-                
-#     #             elapsed = time.time() - start_time
-#     #             remaining = target_duration - elapsed
-
-#     #     self.current_expression = expression
-#     def play(self, expression: str, voice=None):
-#         if expression not in EXPRESSION_MAP:
-#             print(f"Unknown expression: {expression}")
-#             return
-
-#         move_name = EXPRESSION_MAP[expression]
-#         move = self.library.get(move_name)
-#         motion_only = RecordedMove(move=move.move, sound_path=None)
-
-#         # 1. 先播放主要表情動作 (例如 enthusiastic1, thoughtful1)
-#         self.mini.play_move(motion_only, initial_goto_duration=0.5)
-
-#         # 2. 如果語音還在播 (voice.speaking 為 True)，就循環播放自然微動填充動作
-#         fill_move = self.library.get("attentive1")
-#         fill_motion = RecordedMove(move=fill_move.move, sound_path=None)
-
-#         while voice is not None and voice.speaking:
-#             # 只要講話還沒結束，就持續播放短動作
-#             self.mini.play_move(fill_motion, initial_goto_duration=0.2)
-#             time.sleep(0.05)
-
-#         self.current_expression = expression
-
 import numpy as np
 from reachy_mini.utils import create_head_pose
 
@@ -88,7 +27,7 @@ class YawOffsetMove(Move):
 
     def __init__(self, base_move, yaw_offset_deg: float):
         self._base_move = base_move
-        # 建立繞 Z 軸（水平左右轉頭）的 4x4 旋轉矩陣
+        # Build a 4x4 Z-axis (yaw) rotation matrix
         rot = R.from_euler("z", yaw_offset_deg, degrees=True).as_matrix()
         self._rot_4x4 = np.eye(4)
         self._rot_4x4[:3, :3] = rot
@@ -98,11 +37,11 @@ class YawOffsetMove(Move):
         return self._base_move.duration
 
     def evaluate(self, t: float):
-        # 取得原始動作在時間點 t 的 (head_pose, antennas, body_yaw)
+        # Get original (head_pose, antennas, body_yaw) at time t
         head, antennas, body_yaw = self._base_move.evaluate(t)
 
         if head is not None:
-            # 將原本朝正前方的頭部姿態矩陣，左乘 Z 軸旋轉矩陣，讓動作朝向目前看的人
+            # Left-multiply the forward head pose matrix by the Z-axis rotation matrix to face the target person
             head = self._rot_4x4 @ head
 
         return head, antennas, body_yaw
@@ -136,20 +75,16 @@ class ExpressionController:
         pose = create_head_pose(yaw=target_yaw, degrees=True)
         self.mini.set_target(head=pose)
 
-    # def _get_offset_move(self, move_name: str) -> YawOffsetMove:
-    #     """ Get action with current head rotation offset """
-    #     raw_move = self.library.get(move_name)
-    #     return YawOffsetMove(raw_move.move, yaw_offset_deg=self._current_yaw_deg)
     def _get_offset_move(self, move_name: str) -> YawOffsetMove:
         """取得加上當前頭轉角偏移的動作"""
         raw_move = self.library.get(move_name)
-        # 先建立不含內建音效的 RecordedMove（它本身就是一個合法的 Move 物件）
+        # create a RecordedMove without built-in audio (which is itself a valid Move object)
         motion_only = RecordedMove(move=raw_move.move, sound_path=None)
-        # 再將 motion_only 傳入 YawOffsetMove
+        # pass motion_only into YawOffsetMove
         return YawOffsetMove(motion_only, yaw_offset_deg=self._current_yaw_deg)
     
     def play_quick_nod(self):
-        """Non-blocking friendly backchannel nod ('understanding1') while listening."""
+        """Non-blocking friendly backchannel nod ('understanding2') while listening."""
         if self._motion_lock.locked():
             return
         with self._motion_lock:
@@ -167,16 +102,8 @@ class ExpressionController:
             # motion_only = RecordedMove(move=move.move, sound_path=None)
             offset_main_move = self._get_offset_move(move_name)
 
-            # self.mini.play_move(motion_only, initial_goto_duration=0.5)
             # face the speaker and play move
             self.mini.play_move(offset_main_move, initial_goto_duration=0.4)
-
-            # fill_move = self.library.get("attentive1")
-            # fill_motion = RecordedMove(move=fill_move.move, sound_path=None)
-
-            # while voice is not None and voice.speaking:
-            #     self.mini.play_move(fill_motion, initial_goto_duration=0.2)
-            #     time.sleep(0.05)
             
             # if robot hasn't end talking, face the speaker and play 'attentive'
             if voice is not None and voice.speaking:

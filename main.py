@@ -1,4 +1,5 @@
 import argparse
+import random
 import sys
 import time
 import threading
@@ -6,7 +7,6 @@ import traceback
 from reachy_mini import ReachyMini
 from robot.connection import NetworkReachyMini
 import cv2
-from collections import deque
 
 from decision.fusion import make_decision
 from decision.action_planner import ActionPlanner
@@ -51,14 +51,12 @@ class VisionPipelineThread:
             "cv": {},
         }
         
-        # 新增：記憶「最近一次有效說話者」的狀態與時間戳記，解決 Whisper 延遲問題
+        # Short-term memory buffer to bridge the latency between speech end and Whisper transcription
         self._last_active_speaker = "none"
         self._last_looking_at_robot = False
         self._last_target_norm_x = None
         self._last_active_time = 0.0
 
-        # # 儲存最近 90 幀（約 3 秒）的歷史狀態：(timestamp, active_speaker, looking_at_robot, target_norm_x)
-        # self._history = deque(maxlen=90)
         
 
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -96,7 +94,7 @@ class VisionPipelineThread:
                 self._latest_frame = annotated_frame
                 self._last_frame_t = time.monotonic()
 
-                # 只要偵測到有人正在說話，就刷新記憶緩衝區
+                # Update buffer whenever an active speaker is detected
                 if fused["active_speaker"] in ("person_left", "person_right"):
                     self._last_active_speaker = fused["active_speaker"]
                     self._last_looking_at_robot = fused["looking_at_robot"]
@@ -104,14 +102,6 @@ class VisionPipelineThread:
                     self._last_active_time = now
 
             
-                # # 只記錄確實有偵測到人在說話的影格
-                # if fused["active_speaker"] in ("person_left", "person_right"):
-                #     self._history.append((
-                #         now,
-                #         fused["active_speaker"],
-                #         fused["looking_at_robot"],
-                #         fused["target_norm_x"]
-                #     ))
 
     def show_preview(self):
         """Pump the native window on the main thread (required by macOS)."""
@@ -154,12 +144,12 @@ class VisionPipelineThread:
 
     def get_utterance_context(self, lookback_sec: float = 1.0) -> dict:
         """
-        取得供 Turn-taking 決策使用的視覺狀態：
-        若當下嘴巴已閉上，則回溯過去 lookback_sec 秒內最後一位說話者的視線狀態。
+        Retrieve visual state for turn-taking decisions:
+        Falls back to the last active speaker within `lookback_sec` if lips are currently closed.
         """
         with self._lock:
             fused = dict(self._latest_fused)
-            # 如果當下已經沒人動嘴，但 2 秒內剛有人講完話，就套用那個人講話時的視線狀態
+            # If nobody is currently speaking, reuse the gaze state of the last speaker from within the past 1 seconds
             if fused["active_speaker"] == "none" and (time.time() - self._last_active_time <= lookback_sec):
                 fused["active_speaker"] = self._last_active_speaker
                 fused["looking_at_robot"] = self._last_looking_at_robot
@@ -167,38 +157,57 @@ class VisionPipelineThread:
                 fused["confidence"] = "BUFFERED_SPEAKER"
             return fused
 
-    # def get_utterance_context(self, lookback_sec: float = 2.5, gaze_ratio_threshold: float = 0.4) -> dict:
-    #     """
-    #     回溯過去 lookback_sec 秒內的所有說話影格：
-    #     1. 找出這段期間說話幀數最多的人作為 speaker。
-    #     2. 只要他在講話期間有超過 40% (gaze_ratio_threshold) 的時間看著機器人，就判定 looking_at_robot = True。
-    #     """
-    #     now = time.time()
-    #     with self._lock:
-    #         fused = dict(self._latest_fused)
-    #         recent_frames = [item for item in self._history if (now - item[0]) <= lookback_sec]
 
-    #     if not recent_frames:
-    #         return fused
+class RandomGazeController:
+    """
+    Baseline behavior controller:
+    Periodically picks a random detected participant (or fallback left/right position)
+    to look at, ignoring who is actually speaking.
+    """
+    def __init__(self, min_interval_sec: float = 2.5, max_interval_sec: float = 5.0):
+        self.min_interval_sec = min_interval_sec
+        self.max_interval_sec = max_interval_sec
+        self._next_switch_time = 0.0
+        self._current_target_label = "center"
+        self._current_target_norm_x = 0.0
 
-    #     # 統計這段期間誰說最多話
-    #     speakers = [f[1] for f in recent_frames]
-    #     dominant_speaker = max(set(speakers), key=speakers.count)
+    def get_random_gaze_target(self, cv_state: dict) -> float:
+        """Return a horizontal norm_x target (-1.0 to +1.0) updated at random intervals."""
+        now = time.time()
 
-    #     # 篩選出該說話者的影格，計算看機器人的比例與平均座標
-    #     speaker_frames = [f for f in recent_frames if f[1] == dominant_speaker]
-    #     gaze_true_count = sum(1 for f in speaker_frames if f[2] is True)
-    #     gaze_ratio = gaze_true_count / len(speaker_frames)
+        # Pick a new random target when the timer expires
+        if now >= self._next_switch_time:
+            self._next_switch_time = now + random.uniform(self.min_interval_sec, self.max_interval_sec)
 
-    #     valid_norm_x = [f[3] for f in speaker_frames if f[3] is not None]
-    #     avg_norm_x = sum(valid_norm_x) / len(valid_norm_x) if valid_norm_x else None
+            # Collect currently detected participants from CV state
+            candidates = []
+            for label in ("person_left", "person_right"):
+                if label in cv_state and cv_state[label].get("norm_x") is not None:
+                    candidates.append((label, cv_state[label]["norm_x"]))
 
-    #     fused["active_speaker"] = dominant_speaker
-    #     fused["looking_at_robot"] = (gaze_ratio >= gaze_ratio_threshold)
-    #     fused["target_norm_x"] = avg_norm_x
-    #     fused["confidence"] = f"BUFFERED_RATIO ({gaze_ratio:.0%})"
+            if candidates:
+                # Randomly choose one of the visible participants
+                chosen_label, chosen_x = random.choice(candidates)
+                self._current_target_label = chosen_label
+                self._current_target_norm_x = chosen_x
+            else:
+                # Fallback if no faces are currently detected in frame
+                fallback_options = [("fallback_left", -0.35), ("fallback_right", 0.35), ("center", 0.0)]
+                chosen_label, chosen_x = random.choice(fallback_options)
+                self._current_target_label = chosen_label
+                self._current_target_norm_x = chosen_x
 
-    #     return fused
+            print(f"[Baseline Gaze] Switched attention randomly to: {self._current_target_label} "
+                  f"(norm_x={self._current_target_norm_x:.2f}, next switch in {self._next_switch_time - now:.1f}s)")
+        else:
+            # Smoothly track the chosen person's live coordinate if they are still visible
+            if self._current_target_label in cv_state:
+                live_x = cv_state[self._current_target_label].get("norm_x")
+                if live_x is not None:
+                    self._current_target_norm_x = live_x
+
+        return self._current_target_norm_x
+
 
 class ReplyTurn:
     """Reachy's turn: from the start of a reply until its last sentence has been played.
@@ -269,19 +278,34 @@ def speak_reply(nlp: SpeakerNLPModel, voice: ReachyVoice, expression_controller:
 def parse_args(argv=None, description="Reachy Mini multimodal interaction (real robot over Wi-Fi)"):
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--camera", type=int, default=0, help="camera index (default 0)")
+    parser.add_argument(
+        "--mode",
+        choices=("multimodal", "baseline"),
+        default="multimodal",
+        help="Experiment condition: 'multimodal' (speaker-aware gaze) or 'baseline' (random gaze)",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv=None):
     """The real robot over Wi-Fi. For the simulator, run main_sim.py instead."""
-    run(use_real_robot=True, camera_index=parse_args(argv).camera)
+    args = parse_args(argv)
+    run(use_real_robot=True, camera_index=args.camera, mode=args.mode)
 
 
-def run(use_real_robot: bool, camera_index: int = 0):
-    """use_real_robot=True: the robot over Wi-Fi with its mic and sound direction.
-    False: a simulator daemon on this Mac with the laptop mic (see main_sim.py)."""
+def run(use_real_robot: bool, camera_index: int = 0, mode: str = "multimodal"):
+    """
+    use_real_robot=True: the robot over Wi-Fi with its mic and sound direction.
+    False: a simulator daemon on this Mac with the laptop mic (see main_sim.py).
+
+    mode='multimodal': tracks active speaker gaze and nods.
+    mode='baseline': randomly switches gaze between people while keeping turn-taking logic intact.
+    """
     USE_REAL_ROBOT_HARDWARE = use_real_robot
     ROBOT_IP = "reachy-mini.local"
+    is_baseline = (mode == "baseline")
+
+    print(f"\n[Config] Running in '{mode.upper()}' mode")
 
     if USE_REAL_ROBOT_HARDWARE:
         print(f"Connecting to Reachy Mini at {ROBOT_IP}...")
@@ -292,13 +316,10 @@ def run(use_real_robot: bool, camera_index: int = 0):
 
     with robot as mini:
         voice = ReachyVoice()
-        # mic = None  # 若在沒有實體機器人/測試階段可暫時為 None
-        
         
         # Nobody talks while Reachy talks, so the mic is ignored then (no false interruptions
         # from Reachy's own voice).
-        cfg = Config(use_llm=True, llm_backend="claude", allow_interruptions=False) # 或 "ollama"
-        # mic = LaptopMic(cfg) 
+        cfg = Config(use_llm=True, llm_backend="claude", allow_interruptions=False) # or "ollama" 
         mic = RobotMic(mini) if USE_REAL_ROBOT_HARDWARE else LaptopMic(cfg)
         nlp = SpeakerNLPModel(
             cfg=cfg,
@@ -310,6 +331,7 @@ def run(use_real_robot: bool, camera_index: int = 0):
         
         planner = ActionPlanner()
         expression_controller = ExpressionController(mini)
+        random_gaze_controller = RandomGazeController(min_interval_sec=2.5, max_interval_sec=5.0)
         vision_pipeline = VisionPipelineThread(
             camera_index=camera_index,
             robot_ip=ROBOT_IP,
@@ -339,9 +361,7 @@ def run(use_real_robot: bool, camera_index: int = 0):
                     # from the mic and starts the echo guard when Reachy stops.
                     # update NLP status (about 10Hz)
                     nlp_status = nlp.update()
-                    # vision_output = vision_tracker.get_latest()
                     fused_cv = vision_pipeline.get_latest()
-                    # now = time.time()
                     replying = reply_thread is not None and reply_thread.is_alive()
 
                     # interrupting: True if user is speaking while robot is speaking
@@ -350,37 +370,33 @@ def run(use_real_robot: bool, camera_index: int = 0):
                         voice.stop()
                         # motion stop?
 
+                    # --- GAZE & LISTENING BEHAVIOR ---
                     # If the robot is not speaking, check if the user is speaking and if they are looking at the robot
-                    # gaze tracking the speaker + nodding
+                    # gaze tracking the speaker + nodding                   
                     if not replying and not voice.speaking:
-                        listening_action = planner.check_active_listening(fused_cv)
+                        if is_baseline:
+                            # Baseline condition: periodically look at a random participant
+                            random_norm_x = random_gaze_controller.get_random_gaze_target(fused_cv.get("cv", {}))
+                            expression_controller.look_at_norm_x(random_norm_x)
+                        else:
+                            # Multimodal condition: track the active speaker and nod when addressed
+                            listening_action = planner.check_active_listening(fused_cv)
 
-                        if listening_action["target_norm_x"] is not None:
-                            expression_controller.look_at_norm_x(listening_action["target_norm_x"])
+                            if listening_action["target_norm_x"] is not None:
+                                expression_controller.look_at_norm_x(listening_action["target_norm_x"])
 
-                        if listening_action["should_nod"]:
-                            print(f"[Robot] Nodding to {fused_cv['active_speaker']}...")
-                            threading.Thread(
-                                target=expression_controller.play_quick_nod,
-                                daemon=True
-                            ).start()
+                            if listening_action["should_nod"]:
+                                print(f"[Robot] Nodding to {fused_cv['active_speaker']}...")
+                                threading.Thread(
+                                    target=expression_controller.play_quick_nod,
+                                    daemon=True
+                                ).start()
 
-                    #turn-taking
+                    # --- TURN-TAKING & RESPONSE TRIGGER (Preserved across both modes) ---
                     utt = nlp_status["utterance"]
-                    
-
-                    # if utt:
-                    #     print(f"\n[Heard #{utt['id']}] {utt['text']} "
-                    #           f"(said_name={utt['said_name']}, cv_speaker={fused_cv['active_speaker']}, "
-                    #           f"looking={fused_cv['looking_at_robot']})")
-
-                    #     audio_output = {"utterance": utt}
-                    #     decision = make_decision(audio_output, fused_cv)
-                    #     action = planner.process_decision(decision)
-
                     if utt:
                         heard_at = time.time()
-                        # 使用帶有 2 秒記憶緩衝的視覺狀態，避免因為閉嘴等待 Whisper 辨識而漏掉狀態
+                        # Apply buffer to visual state to prevent dropouts during Whisper transcription latency
                         utterance_cv = vision_pipeline.get_utterance_context(lookback_sec=2.0)
 
                         print(f"\n[Heard #{utt['id']}] {utt['text']} "
@@ -400,9 +416,11 @@ def run(use_real_robot: bool, camera_index: int = 0):
                                   f"({decision['evidence']['addressee_method']}) -> should_speak={action['should_speak']}")
 
                             if action["should_speak"]:
-                                # face the spaeker before replying
-                                if decision["target_norm_x"] is not None:
+                                # In multimodal mode, orient toward the speaker before answering.
+                                # In baseline mode, keep the current random head orientation.
+                                if not is_baseline and decision["target_norm_x"] is not None:
                                     expression_controller.look_at_norm_x(decision["target_norm_x"])
+
                                 reply_thread = threading.Thread(
                                     target=run_reply, args=(utt, heard_at), daemon=True)
                                 reply_thread.start()

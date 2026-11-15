@@ -43,4 +43,4 @@ if __name__ == "__main__":
     args = parse_args(description="Reachy Mini multimodal interaction (simulator on this Mac)")
     if not check_simulator():
         sys.exit(1)
-    run(use_real_robot=False, camera_index=args.camera)
+    run(use_real_robot=False, camera_index=args.camera, mode=args.mode)
